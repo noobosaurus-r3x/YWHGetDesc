@@ -1,4 +1,208 @@
 (() => {
+  const SEVERITY_ORDER = ['Low', 'Medium', 'High', 'Critical'];
+
+  function cleanText(value) {
+    return (value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function escapeMdCell(value) {
+    return String(value || '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+  }
+
+  function detectWildcard(asset) {
+    const value = (asset || '').toLowerCase();
+    return value.includes('*.') || value.includes('/*') || value.includes('/**') || value.includes('{subdomain}');
+  }
+
+  function normalizeAssetType(type) {
+    const value = (type || '').toLowerCase();
+
+    if (!value) return 'unknown';
+    if (value.includes('api')) return 'api';
+    if (value.includes('android')) return 'android_app';
+    if (value.includes('ios')) return 'ios_app';
+    if (value.includes('mobile')) return 'mobile_app';
+    if (value.includes('web') || value.includes('url') || value.includes('website')) return 'web';
+    if (value.includes('domain') || value.includes('host') || value.includes('subdomain')) return 'domain';
+    if (value.includes('ip') || value.includes('cidr') || value.includes('range')) return 'ip';
+    if (value.includes('source')) return 'source_code';
+    if (value.includes('repo') || value.includes('git')) return 'repository';
+    if (value.includes('desktop')) return 'desktop_app';
+    if (value.includes('hardware') || value.includes('device') || value.includes('iot')) return 'device';
+    if (value.includes('email')) return 'email';
+
+    return value.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'unknown';
+  }
+
+  function inferEnvironment(asset) {
+    const value = (asset || '').toLowerCase();
+    const patterns = [
+      ['staging', /(^|[^a-z])(recette)([^a-z]|$)/],
+      ['sandbox', /(^|[^a-z])(sandbox)([^a-z]|$)/],
+      ['staging', /(^|[^a-z])(staging|stage|preprod|pre-prod)([^a-z]|$)/],
+      ['development', /(^|[^a-z])(dev|development)([^a-z]|$)/],
+      ['test', /(^|[^a-z])(test|testing|qa|uat)([^a-z]|$)/],
+      ['production', /(^|[^a-z])(prod|production|live)([^a-z]|$)/]
+    ];
+
+    for (const [name, regex] of patterns) {
+      if (regex.test(value)) return name;
+    }
+
+    return 'unknown';
+  }
+
+  function extractSeverityLabels(value) {
+    const text = (value || '').toLowerCase();
+    return SEVERITY_ORDER.filter(label => text.includes(label.toLowerCase()));
+  }
+
+  function highestRewardSeverity(rewards) {
+    const available = SEVERITY_ORDER.filter(label => cleanText(rewards[label]));
+    return available.length ? available[available.length - 1] : '';
+  }
+
+  function inferMaxSeverity(assetValue, rewards) {
+    const severityLabels = extractSeverityLabels(assetValue);
+    if (severityLabels.length) return severityLabels[severityLabels.length - 1];
+
+    const text = (assetValue || '').toLowerCase();
+    if (!text) return '';
+    if (/(not eligible|no bounty|non rewarded|informational only|swag only|hall of fame only)/.test(text)) return 'None';
+    if (/(bounty|reward|eligible|paid|yes)/.test(text)) return highestRewardSeverity(rewards);
+
+    return '';
+  }
+
+  function inferBountyEligibility(assetValue, rewards) {
+    const text = (assetValue || '').toLowerCase();
+    if (!text) return null;
+    if (/(not eligible|no bounty|non rewarded|informational only|swag only|hall of fame only)/.test(text)) return false;
+    if (/(bounty|reward|eligible|paid|yes)/.test(text)) return true;
+    if (extractSeverityLabels(assetValue).length) return true;
+    return highestRewardSeverity(rewards) ? null : false;
+  }
+
+  function normalizeScope(scope, rewards) {
+    const asset = cleanText(scope.scope || scope.asset || '');
+    const assetValue = cleanText(scope.assetValue);
+
+    return {
+      ...scope,
+      asset,
+      asset_type: normalizeAssetType(scope.type),
+      wildcard: detectWildcard(asset),
+      environment: inferEnvironment(asset),
+      max_severity: inferMaxSeverity(assetValue, rewards),
+      bounty_eligible: inferBountyEligibility(assetValue, rewards)
+    };
+  }
+
+  function rewardsToMarkdown(rewards) {
+    const rewardRows = SEVERITY_ORDER.filter(label => cleanText(rewards[label]));
+    if (!rewardRows.length) return '_No reward data extracted._\n\n';
+
+    let md = '| Severity | Amount |\n| --- | --- |\n';
+    rewardRows.forEach(label => {
+      md += `| ${label} | ${escapeMdCell(rewards[label])} |\n`;
+    });
+    return `${md}\n`;
+  }
+
+  function listToMarkdown(items, emptyMessage) {
+    if (!items.length) return `${emptyMessage}\n\n`;
+    return `${items.map(item => `- ${item}`).join('\n')}\n\n`;
+  }
+
+  function scopeTableToMarkdown(scopes) {
+    if (!scopes.length) return '_No in-scope assets extracted._\n\n';
+
+    let md = '| Asset | Type | Normalized Type | Wildcard | Environment | Max Severity | Bounty Eligible | Reports | Asset Value |\n';
+    md += '| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n';
+    scopes.forEach(scope => {
+      md += `| ${escapeMdCell(scope.asset)} | ${escapeMdCell(scope.type)} | ${escapeMdCell(scope.asset_type)} | ${scope.wildcard ? 'yes' : 'no'} | ${escapeMdCell(scope.environment)} | ${escapeMdCell(scope.max_severity || '')} | ${scope.bounty_eligible === null ? '' : scope.bounty_eligible ? 'yes' : 'no'} | ${escapeMdCell(scope.reports)} | ${escapeMdCell(scope.assetValue)} |\n`;
+    });
+    return `${md}\n`;
+  }
+
+  function headingMatches(text, expected) {
+    const normalized = cleanText(text).toLowerCase();
+    return normalized === expected || normalized.includes(expected);
+  }
+
+  function collectListItemsFromNode(node) {
+    if (!node) return [];
+
+    if (node.tagName === 'UL' || node.tagName === 'OL') {
+      return Array.from(node.querySelectorAll(':scope > li'))
+        .map(li => cleanText(li.innerText || li.textContent))
+        .filter(Boolean);
+    }
+
+    const directLists = Array.from(node.querySelectorAll(':scope > ul, :scope > ol'));
+    if (directLists.length) {
+      return directLists.flatMap(list => collectListItemsFromNode(list));
+    }
+
+    return Array.from(node.querySelectorAll('li'))
+      .map(li => cleanText(li.innerText || li.textContent))
+      .filter(Boolean);
+  }
+
+  function shouldMergeListItem(previous, current) {
+    if (!previous || !current) return false;
+
+    const currentWordCount = current.split(/\s+/).filter(Boolean).length;
+    const currentStartsLowercase = /^[a-z(]/.test(current);
+    const previousEndsWithConnector = /(and|or|to|an|a|the|of|for|via|with|without|through|under|that|not|victim's|services \(e\.g\.|HTTP|Logout \/)$/i.test(previous);
+    const previousEndsOpen = /[(\/]$/.test(previous);
+    const previousParenBalance = (previous.match(/\(/g) || []).length - (previous.match(/\)/g) || []).length;
+
+    if (previousEndsWithConnector && currentWordCount <= 6) return true;
+    if (previousEndsOpen && currentWordCount <= 8) return true;
+    if (previousParenBalance > 0) return true;
+    if (currentStartsLowercase && currentWordCount <= 8) return true;
+
+    return false;
+  }
+
+  function normalizeListItems(items) {
+    return items.reduce((result, item) => {
+      if (!result.length) {
+        result.push(item);
+        return result;
+      }
+
+      const previous = result[result.length - 1];
+      if (shouldMergeListItem(previous, item)) {
+        result[result.length - 1] = `${previous} ${item}`;
+      } else {
+        result.push(item);
+      }
+
+      return result;
+    }, []);
+  }
+
+  function extractListByHeading(expectedHeading) {
+    const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'));
+    for (const heading of headings) {
+      if (!headingMatches(heading.textContent, expectedHeading)) continue;
+
+      let node = heading.nextElementSibling;
+      while (node) {
+        if (/^H[1-6]$/.test(node.tagName)) break;
+
+        const items = normalizeListItems(collectListItemsFromNode(node));
+        if (items.length) return items;
+
+        node = node.nextElementSibling;
+      }
+    }
+
+    return [];
+  }
+
   function extractProgramData() {
     const title = document.querySelector('h1.program-title')?.textContent?.trim() || '';
     const url = window.location.href;
@@ -39,40 +243,17 @@
     });
 
     // Qualifying vulnerabilities
-    const qualifying = [];
-    const qualSection = descriptionEl?.querySelector('h3:not(.mt-4)')
-      ? null
-      : document.querySelector('#program-vulneraibility-types');
-    if (qualSection) {
-      const qualDiv = qualSection.querySelector('div:first-of-type');
-      qualDiv?.querySelectorAll('li').forEach(li => {
-        qualifying.push(li.textContent.trim());
-      });
-    }
+    const qualifying = extractListByHeading('qualifying vulnerabilities');
 
     // Non-qualifying vulnerabilities
-    const nonQualifying = [];
-    const nonQualDiv = qualSection?.querySelectorAll('div')?.[1];
-    nonQualDiv?.querySelectorAll('li').forEach(li => {
-      nonQualifying.push(li.textContent.trim());
-    });
+    const nonQualifying = extractListByHeading('non-qualifying vulnerabilities');
 
     // Out of scopes
-    const outOfScopes = [];
-    const outOfScopeSection = document.querySelectorAll('#program-scopes ~ div li, h3.mb-2 ~ span li');
-    document.querySelectorAll('h3').forEach(h3 => {
-      if (h3.textContent.trim() === 'Out of scopes') {
-        const container = h3.nextElementSibling;
-        container?.querySelectorAll('li').forEach(li => {
-          outOfScopes.push(li.textContent.trim());
-        });
-      }
-    });
+    const outOfScopes = extractListByHeading('out of scopes');
 
     // Program info
     const programType = document.querySelector('#program-card-information-section .tag-content')?.textContent?.trim() || '';
     const visibility = document.querySelectorAll('#program-card-information-section .tag-content')?.[1]?.textContent?.trim() || '';
-    const lastUpdate = '';
     document.querySelectorAll('#program-card-information-section span').forEach(span => {
       if (span.textContent.includes('Last update on')) {
         const match = span.textContent.match(/Last update on (\S+)/);
@@ -89,6 +270,8 @@
       }
     });
 
+    const normalizedScopes = scopes.map(scope => normalizeScope(scope, rewards));
+
     return {
       title,
       url,
@@ -97,7 +280,7 @@
       descriptionText,
       descriptionHtml,
       rewards,
-      scopes,
+      scopes: normalizedScopes,
       outOfScopes,
       qualifyingVulnerabilities: qualifying,
       nonQualifyingVulnerabilities: nonQualifying,
@@ -108,47 +291,47 @@
 
   // Convert data to markdown
   function toMarkdown(data) {
+    const scopeStats = {
+      wildcard: data.scopes.filter(scope => scope.wildcard).length,
+      bountyEligible: data.scopes.filter(scope => scope.bounty_eligible === true).length
+    };
+
     let md = `# ${data.title}\n\n`;
-    md += `**URL:** ${data.url}\n`;
-    md += `**Type:** ${data.programType}\n`;
-    md += `**Visibility:** ${data.visibility}\n`;
-    if (data.userAgent) md += `**User-Agent:** \`${data.userAgent}\`\n`;
-    md += `**Extracted:** ${data.extractedAt}\n\n`;
+    md += `## Program\n\n`;
+    md += `- URL: ${data.url}\n`;
+    md += `- Type: ${data.programType || 'Unknown'}\n`;
+    md += `- Visibility: ${data.visibility || 'Unknown'}\n`;
+    md += `- Extracted: ${data.extractedAt}\n`;
+    if (data.rewards.lastUpdate) md += `- Last update: ${data.rewards.lastUpdate}\n`;
+    if (data.userAgent) md += `- User-Agent: \`${data.userAgent}\`\n`;
+    md += `- Scope count: ${data.scopes.length}\n`;
+    md += `- Wildcard scope count: ${scopeStats.wildcard}\n`;
+    md += `- Bounty-eligible scope count: ${scopeStats.bountyEligible}\n\n`;
 
     md += `## Rewards\n\n`;
-    md += `| Severity | Amount |\n|----------|--------|\n`;
-    for (const [key, val] of Object.entries(data.rewards)) {
-      if (key === 'lastUpdate') continue;
-      md += `| ${key} | ${val} |\n`;
-    }
-    md += '\n';
+    md += rewardsToMarkdown(data.rewards);
 
-    md += `## Program Description\n\n${data.descriptionText}\n\n`;
+    md += `## Scope\n\n`;
+    md += scopeTableToMarkdown(data.scopes);
 
-    md += `## Scopes (${data.scopes.length})\n\n`;
-    md += `| Scope | Type | Reports | Asset Value |\n|-------|------|---------|-------------|\n`;
-    data.scopes.forEach(s => {
-      md += `| ${s.scope} | ${s.type} | ${s.reports} | ${s.assetValue} |\n`;
-    });
-    md += '\n';
+    md += `## Out of Scope\n\n`;
+    md += listToMarkdown(data.outOfScopes, '_No explicit out-of-scope items extracted._');
 
-    if (data.outOfScopes.length) {
-      md += `## Out of Scopes\n\n`;
-      data.outOfScopes.forEach(s => { md += `- ${s}\n`; });
-      md += '\n';
-    }
+    md += `## Qualifying Vulns\n\n`;
+    md += listToMarkdown(data.qualifyingVulnerabilities, '_No qualifying vulnerability list extracted._');
 
-    if (data.qualifyingVulnerabilities.length) {
-      md += `## Qualifying Vulnerabilities\n\n`;
-      data.qualifyingVulnerabilities.forEach(v => { md += `- ${v}\n`; });
-      md += '\n';
-    }
+    md += `## Non-Qualifying Vulns\n\n`;
+    md += listToMarkdown(data.nonQualifyingVulnerabilities, '_No non-qualifying vulnerability list extracted._');
 
-    if (data.nonQualifyingVulnerabilities.length) {
-      md += `## Non-Qualifying Vulnerabilities\n\n`;
-      data.nonQualifyingVulnerabilities.forEach(v => { md += `- ${v}\n`; });
-      md += '\n';
-    }
+    md += `## Notes\n\n`;
+    md += '- Initial focus:\n';
+    md += '- Interesting assets:\n';
+    md += '- Auth requirements / test accounts:\n';
+    md += '- Potential high-signal vuln classes:\n';
+    md += '- Follow-up recon:\n\n';
+
+    md += `## Program Description\n\n`;
+    md += `${data.descriptionText || '_No program description extracted._'}\n`;
 
     return md;
   }
